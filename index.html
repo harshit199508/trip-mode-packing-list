@@ -1,5 +1,4 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8">
-<title>Packing List</title>
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Packing List</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -324,6 +323,12 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--blue); outl
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
 
+/* Keyboard avoidance: bottom CTAs ride on top of the software keyboard (iOS behaviour) */
+.savebar, .fab-wrap { transform: translateY(calc(-1 * var(--kb-lift, 0px))); transition: transform .32s cubic-bezier(.38,.7,.125,1); }
+.screen.kb-open .savebar { padding-bottom: 10px; }
+.screen.kb-open .fab-wrap { bottom: 12px; }
+.screen.kb-open .scroll { padding-bottom: calc(130px + var(--kb-lift, 0px)); }
+
 /* ---- Standalone iPhone app mode: the phone screen fills the device; real status bar + home indicator ---- */
 html, body { height: 100%; overflow: hidden; overscroll-behavior: none; background: #000; }
 body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
@@ -457,10 +462,82 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
   // Item entry: commas, slashes, semicolons and new lines split one entry into separate items.
   const splitItems = t => String(t).split(/[,/;\n،、]+/).map(s => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const haptic = (ms = 8) => { try { navigator.vibrate && navigator.vibrate(ms); } catch {} };
+  // ---- Haptics (iOS Human Interface Guidelines feedback types, same mapping as the SwiftUI app) ----
+  // iPhone Safari has no Vibration API. Since iOS 18, toggling an <input type="checkbox" switch> plays the
+  // system haptic tick, so on iPhone each "tap" below is one system tick; patterns approximate the
+  // UINotificationFeedbackGenerator rhythms. Android/Chrome uses navigator.vibrate with per-style durations.
+  // iOS only plays it during (or right after) a touch, and never when Reduce Motion / System Haptics is off.
+  const Haptics = (() => {
+    const canVibrate = typeof navigator !== 'undefined' && 'vibrate' in navigator;
+    const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    let label = null, enabled = true;
+    const ensure = () => {
+      if (label) return label;
+      label = document.createElement('label');
+      label.setAttribute('aria-hidden', 'true');
+      label.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none';
+      const input = document.createElement('input');
+      input.type = 'checkbox'; input.setAttribute('switch', ''); input.tabIndex = -1;
+      label.appendChild(input); document.body.appendChild(label);
+      const stop = e => e.stopPropagation();          // keep the page's own click handlers out of it
+      label.addEventListener('click', stop); input.addEventListener('click', stop);
+      return label;
+    };
+    const tick = () => {
+      const active = document.activeElement;           // never steal focus (keeps the keyboard up while adding items)
+      try { ensure().click(); } catch {}
+      if (active && active !== document.activeElement && active.focus) try { active.focus({ preventScroll: true }); } catch {}
+    };
+    // [delay ms, android vibrate ms] per tap
+    const STYLES = {
+      selection: [[0, 6]],                       // UISelectionFeedbackGenerator: check/uncheck, reorder slot change
+      light:     [[0, 10]],                      // UIImpactFeedbackGenerator .light: drop, add item, undo
+      medium:    [[0, 18]],                      // .medium: drag lift, long-press, swipe threshold, delete
+      heavy:     [[0, 28]],                      // .heavy
+      rigid:     [[0, 12]],
+      soft:      [[0, 14]],
+      success:   [[0, 12], [110, 18]],           // UINotificationFeedbackGenerator .success: save, list created, all packed
+      warning:   [[0, 18], [140, 12]],           // .warning: destructive confirmation sheet
+      error:     [[0, 14], [90, 14], [90, 22]],  // .error: validation failure
+    };
+    const play = (style = 'light') => {
+      if (!enabled) return;
+      const seq = STYLES[style] || STYLES.light;
+      if (canVibrate && !isIOS) {
+        const pat = []; seq.forEach(([d, v], i) => { if (i) pat.push(Math.max(d - seq[i - 1][1], 0)); pat.push(v); });
+        try { navigator.vibrate(pat.length === 1 ? pat[0] : pat); } catch {}
+        return;
+      }
+      let t = 0; seq.forEach(([d]) => { t += d; if (t === 0) tick(); else setTimeout(tick, t); });
+    };
+    return { play, set enabled(v) { enabled = !!v; }, get enabled() { return enabled; } };
+  })();
+  const haptic = style => Haptics.play(typeof style === 'string' ? style : 'light');
 
   const screen = document.getElementById('screen');
   const app = document.getElementById('app');
+
+  // ---- Keyboard avoidance ----
+  // iOS Safari doesn't shrink the page when the keyboard opens; the visual viewport does. Lift the
+  // bottom CTAs (Save list, Add item, Create new list) by however much of the screen the keyboard covers.
+  (() => {
+    const vv = window.visualViewport; if (!vv) return;
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      const r = screen.getBoundingClientRect();
+      const visibleBottom = vv.offsetTop + vv.height;
+      const lift = Math.max(0, Math.round(r.bottom - visibleBottom));
+      const typing = !!document.activeElement && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName) && document.activeElement.type !== 'checkbox';
+      const open = typing && lift > 80;   // ignore toolbar/URL-bar wiggles
+      screen.style.setProperty('--kb-lift', (open ? lift : 0) + 'px');
+      screen.classList.toggle('kb-open', open);
+    };
+    const queue = () => { if (!raf) raf = requestAnimationFrame(update); };
+    vv.addEventListener('resize', queue); vv.addEventListener('scroll', queue);
+    document.addEventListener('focusin', () => setTimeout(queue, 60));
+    document.addEventListener('focusout', () => setTimeout(queue, 60));
+  })();
 
   // iOS scroll-edge effect: the nav blur/dim appears once content slides under it
   app.addEventListener('scroll', e => { const sc = e.target; if (!sc.classList || !sc.classList.contains('scroll')) return; const nav = sc.parentElement.querySelector('.nav'); nav && nav.classList.toggle('scrolled', sc.scrollTop > 4); }, true);
@@ -514,7 +591,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
     screen.appendChild(toastEl);
     const el = toastEl;
     const hide = () => { el.classList.add('out'); setTimeout(() => el.remove(), 260); };
-    if (undo) el.querySelector('button').onclick = () => { undo(); hide(); haptic(); };
+    if (undo) el.querySelector('button').onclick = () => { undo(); hide(); haptic('light'); };
     toastTimer = setTimeout(hide, undo ? 4200 : 2600);
   }
 
@@ -537,7 +614,6 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
     const close = () => { ov.remove(); onClose && onClose(); };
     ov.addEventListener('pointerdown', e => { if (e.target === ov) close(); });
     m.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; close(); items[+b.dataset.i].action(); });
-    haptic(12);
   }
 
   function showSheet(kind, onConfirm, onCancel) {
@@ -555,7 +631,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
     const cancel = () => { close(); onCancel && onCancel(); };
     back.onclick = cancel; sh.querySelector('.cancel').onclick = cancel; sh.querySelector('.close-btn').onclick = cancel;
     sh.querySelector('.ok').onclick = () => { close(); setTimeout(onConfirm, 120); };
-    haptic(20);
+    haptic('warning');
   }
 
   // ---------- FLIP helper ----------
@@ -591,7 +667,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
       this.target = this.idx;
       wrap.classList.add('dragging');
       this.wraps.forEach(w => { if (w !== wrap) w.style.transition = 'transform .24s cubic-bezier(.2,.8,.2,1)'; });
-      haptic(15);
+      haptic('medium');   // lift
     },
     move(y) {
       const sr = this.sc.getBoundingClientRect();
@@ -601,7 +677,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
       const center = this.mids[this.idx] + dy;
       let t = 0;
       this.mids.forEach((m, i) => { if (i !== this.idx && m < center) t++; });
-      if (t !== this.target) { this.target = t; haptic(4); }
+      if (t !== this.target) { this.target = t; haptic('selection'); }
       const shift = this.hs[this.idx] + 12;
       this.wraps.forEach((w, i) => {
         if (i === this.idx) return;
@@ -619,7 +695,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
       wrap.style.transition = 'transform .22s cubic-bezier(.2,.8,.2,1)';
       wrap.style.transform = `translateY(${off - (this.sc.scrollTop - this.st)}px)`;
       setTimeout(() => { wrap.classList.remove('dragging'); this.opts.onReorder(idx, target); }, 210);
-      haptic(10);
+      haptic('light');    // drop
     }
   };
   Object.assign(I, {"boarding": "<svg viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M3 15.8472C3 16.8291 3.79594 17.625 4.77778 17.625L15.5 17.625L15.5 16.2188C15.5 15.9426 15.7239 15.7188 16 15.7188C16.2761 15.7188 16.5 15.9426 16.5 16.2188L16.5 17.625H19.2222C20.2041 17.625 21 16.8291 21 15.8472V8.15278C21 7.17094 20.2041 6.375 19.2222 6.375H16.5V7.78125C16.5 8.0574 16.2761 8.28125 16 8.28125C15.7239 8.28125 15.5 8.0574 15.5 7.78125V6.375H4.77778C3.79594 6.375 3 7.17094 3 8.15278V15.8472ZM16.5 10.5938C16.5 10.3176 16.2761 10.0938 16 10.0938C15.7239 10.0938 15.5 10.3176 15.5 10.5938V13.4063C15.5 13.6824 15.7239 13.9063 16 13.9063C16.2761 13.9063 16.5 13.6824 16.5 13.4063V10.5938ZM9.20898 13.114C9.20898 13.3902 8.98513 13.614 8.70898 13.614H5.70898C5.43284 13.614 5.20898 13.3902 5.20898 13.114C5.20898 12.8379 5.43284 12.614 5.70898 12.614H8.70898C8.98513 12.614 9.20898 12.8379 9.20898 13.114ZM11.709 15.614C11.9851 15.614 12.209 15.3902 12.209 15.114C12.209 14.8379 11.9851 14.614 11.709 14.614H5.70898C5.43284 14.614 5.20898 14.8379 5.20898 15.114C5.20898 15.3902 5.43284 15.614 5.70898 15.614H11.709Z\" fill=\"currentColor\"/></svg>", "wifi": "<svg viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M5.28319 9.70863C9.04464 5.92819 14.9179 6.38724 18.7573 9.74442C19.4922 10.387 20.4716 9.23771 19.7421 8.59979C15.3135 4.72739 8.53325 4.30268 4.2221 8.63558C3.5383 9.32283 4.59431 10.401 5.28319 9.70863ZM7.06419 12.5438C9.80235 9.78487 14.2284 10.1545 17.0144 12.5812C17.7505 13.2224 18.7277 12.0711 17.997 11.4346C14.6209 8.49397 9.28889 8.16003 6.00176 11.472C5.31882 12.1602 6.37617 13.237 7.06419 12.5438ZM9.25175 15.4342C8.56373 16.1274 7.50638 15.0506 8.18932 14.3625C10.2803 12.2557 13.7057 12.3752 15.8268 14.3405C16.5377 14.9993 15.526 16.1198 14.8097 15.4561C13.2744 14.0335 10.7828 13.8915 9.25175 15.4342ZM12.0168 18.461C12.5702 18.461 13.0188 18.0088 13.0188 17.4509C13.0188 16.893 12.5702 16.4408 12.0168 16.4408C11.4635 16.4408 11.0149 16.893 11.0149 17.4509C11.0149 18.0088 11.4635 18.461 12.0168 18.461Z\" fill=\"currentColor\"/></svg>", "explore": "<svg viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M12 4C12.2523 4 12.4829 4.14254 12.5958 4.3682L19.9297 19.036C20.0578 19.2923 20.0077 19.6018 19.8053 19.8045C19.6028 20.0073 19.2934 20.0579 19.037 19.9301L12 16.4256L4.96305 19.9301C4.70658 20.0579 4.39717 20.0073 4.19474 19.8045C3.99231 19.6018 3.94221 19.2923 4.07034 19.036L11.4042 4.3682C11.5171 4.14254 11.7477 4 12 4ZM6.15317 17.8492L11.7031 15.0852C11.8901 14.9921 12.1099 14.9921 12.2969 15.0852L17.8468 17.8492L12 6.1555L6.15317 17.8492Z\" fill=\"currentColor\"/></svg>", "currency": "<svg viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M12 21C16.9706 21 21 16.9706 21 12C21 7.02944 16.9706 3 12 3C7.02944 3 3 7.02944 3 12C3 16.9706 7.02944 21 12 21ZM8.90665 7.20001C8.45444 7.20001 8.08785 7.5666 8.08785 8.01881C8.08785 8.47102 8.45444 8.83761 8.90665 8.83761H11.6033C11.8937 9.29635 12.0766 9.68563 12.1844 10.0121H8.90665C8.45444 10.0121 8.08785 10.3787 8.08785 10.8309C8.08785 11.2832 8.45444 11.6497 8.90665 11.6497H11.9167C11.4648 12.068 10.6809 12.3083 9.96916 12.3824C9.20999 12.4614 9.0214 13.3469 9.46882 13.7943L12.6347 16.9602C12.9544 17.28 13.4729 17.28 13.7926 16.9602C14.1124 16.6404 14.1124 16.122 13.7926 15.8022L11.6546 13.6642C12.2597 13.4402 12.8656 13.0916 13.3086 12.5569C13.5283 12.2918 13.7009 11.9888 13.8121 11.6497H15.0933C15.5456 11.6497 15.9121 11.2832 15.9121 10.8309C15.9121 10.3787 15.5456 10.0121 15.0933 10.0121H13.8773C13.8007 9.63808 13.6664 9.24698 13.4731 8.83761H15.0933C15.5456 8.83761 15.9121 8.47102 15.9121 8.01881C15.9121 7.5666 15.5456 7.20001 15.0933 7.20001H8.90665Z\" fill=\"currentColor\"/></svg>", "flight": "<svg viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" clip-rule=\"evenodd\" d=\"M19.4629 7.13727C20.179 6.41958 20.179 5.25597 19.4629 4.53827C18.7468 3.82058 17.5858 3.82058 16.8697 4.53827L13.7591 7.65579L6.69622 5.73617C6.17048 5.60182 5.60854 5.74511 5.20396 6.11669L4.49615 6.76677C3.99701 7.22519 4.08619 8.03235 4.67151 8.35396L10.1969 11.2259L7.43311 13.9959L5.79571 13.5446C5.53334 13.492 5.26016 13.5758 5.06894 13.7674L4.15437 14.684C3.92149 14.9174 3.95698 15.3029 4.22786 15.482L6.78914 17.1591L8.50797 19.7716C8.6867 20.0431 9.07126 20.0787 9.30414 19.8453L10.2187 18.9287C10.4099 18.737 10.4935 18.4632 10.441 18.2003L10.0124 16.6089L12.8915 13.7234L15.6202 19.327C15.9411 19.9136 16.7464 20.003 17.2038 19.5027L17.8525 18.7934C18.2232 18.3879 18.3662 17.8247 18.2321 17.2978L16.3399 10.2672L19.4629 7.13727Z\" fill=\"currentColor\"/></svg>"}); // Boarding Pass Filled, Wifi, Navigation, Rupee Circle Filled, Flight Tilted Right Filled
@@ -641,7 +717,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
         e.preventDefault(); mode = 'drag'; try { row.setPointerCapture(pid); } catch {}
         drag.start(wrap, sy, opts); return;
       }
-      lp = setTimeout(() => { if (mode === 'pending') { mode = 'pressed'; wrap.classList.add('pressing'); haptic(12); } }, 380);
+      lp = setTimeout(() => { if (mode === 'pending') { mode = 'pressed'; wrap.classList.add('pressing'); haptic('medium'); } }, 380);
     });
     row.addEventListener('pointermove', e => {
       if (!mode || e.pointerId !== pid) return;
@@ -660,7 +736,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
         wrap.classList.toggle('swipe-left', dx < 0);
         wrap.classList.toggle('swipe-right', dx > 0);
         const armed = dx < -170 || dx > 90;
-        if (armed !== wrap.classList.contains('armed')) { wrap.classList.toggle('armed', armed); if (armed) haptic(10); }
+        if (armed !== wrap.classList.contains('armed')) { wrap.classList.toggle('armed', armed); if (armed) haptic('medium'); }
       }
       if (mode === 'drag') { e.preventDefault(); drag.move(e.clientY); }
     });
@@ -804,7 +880,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
       const askDelete = wrap => {
         const id = wrap.dataset.id; const idx = lists.findIndex(x => x.id === id); if (idx < 0) return;
         const removed = lists[idx];
-        haptic(15);
+        haptic('medium');
         collapseOut(wrap, () => {
           lists.splice(idx, 1); save(); flip(cards, v.refresh);
           toast('The list is successfully deleted', () => { lists.splice(Math.min(idx, lists.length), 0, removed); save(); flip(cards, v.refresh); });
@@ -840,7 +916,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
             open.onfinish = () => {
               w.style.cssText = '';
               w.animate([{ opacity: 0, transform: 'scale(.9) translateY(-8px)' }, { opacity: 1, transform: 'none' }], { duration: 380, easing: 'cubic-bezier(.3,1.5,.5,1)' });
-              haptic(10);
+              haptic('success');
             };
           }, 460);
         }
@@ -928,7 +1004,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
     function commitNew(val, keep) {
       if (!adding) return;
       const parts = splitItems(val), t = parts.length;
-      if (t) { L().items.unshift(...parts.map(p => ({ id: uid(), title: p, checked: false }))); save(); haptic(6); }
+      if (t) { L().items.unshift(...parts.map(p => ({ id: uid(), title: p, checked: false }))); save(); haptic('light'); }
       if (!keep || !t) adding = false;
       renderNav(); renderHead(); flip(rowsEl, renderRows);
     }
@@ -948,8 +1024,8 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
       const ei = rowsEl.querySelector('.edit-input input'); if (ei) commitEdit(ei.value);
     }
     function toggle(it, wrap) {
-      haptic(8);
       it.checked = !it.checked; save();
+      haptic(it.checked && L().items.every(i => i.checked) ? 'success' : 'selection');   // all packed → success
       const row = wrap && wrap.querySelector('.row');
       if (row) { row.classList.toggle('checked', it.checked); row.setAttribute('aria-checked', it.checked); const al = wrap.querySelector('.act-left'); if (al) al.lastChild.textContent = it.checked ? ' Unpack' : ' Packed'; }
       renderHead();
@@ -964,7 +1040,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
     }
     function deleteItem(it, wrap) {
       const l = L(); const idx = l.items.indexOf(it); if (idx < 0) return;
-      haptic(15);
+      haptic('medium');
       collapseOut(wrap, () => {
         l.items.splice(idx, 1); save(); renderHead(); flip(rowsEl, renderRows); renderNav();
       });
@@ -1046,7 +1122,7 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
     function commitNew(val, keep) {
       if (!adding) return;
       const parts = splitItems(val), t = parts.length;
-      if (t) { items.unshift(...parts.map(p => ({ id: uid(), title: p, checked: false }))); haptic(6); }
+      if (t) { items.unshift(...parts.map(p => ({ id: uid(), title: p, checked: false }))); haptic('light'); }
       if (!keep || !t) adding = false;
       flip(rowsEl, render);
     }
@@ -1063,11 +1139,11 @@ body { position: fixed; inset: 0; touch-action: manipulation; -webkit-tap-highli
     saveBtn.onclick = () => {
       flushInputs(); adding = false;
       if (!title.trim()) {
-        render(); setTitleError(true); haptic([12, 50, 12]);
+        render(); setTitleError(true); haptic('error');
         scroller.scrollTo({ top: 0, behavior: 'smooth' }); titleIn.focus();
         return;
       }
-      haptic([8, 30, 8]);
+      haptic('success');
       const clean = items.map(i => ({ id: i.src || i.id, title: i.title, checked: i.checked }));
       if (editing) {
         const l = getList(listId); l.name = title.trim(); l.ill = illFor(l.name); l.items = clean; save();
